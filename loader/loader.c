@@ -1248,6 +1248,27 @@ void loaderDeleteLayerListAndProperties(const struct loader_instance *inst, stru
     }
 }
 
+void loaderRemoveLayerInList(const struct loader_instance *inst, struct loader_layer_list *layer_list, uint32_t layer_to_remove) {
+    if (layer_list == NULL || layer_to_remove >= layer_list->count) {
+        return;
+    }
+    if (layer_list->list[layer_to_remove].type_flags & VK_LAYER_TYPE_FLAG_META_LAYER) {
+        // Delete the component layers
+        loader_instance_heap_free(inst, layer_list->list[layer_to_remove].component_layer_names);
+        loader_instance_heap_free(inst, layer_list->list[layer_to_remove].override_paths);
+        // Never need to free the blacklist, since it can only exist in the override layer
+    }
+
+    // Remove the current invalid meta-layer from the layer list.  Use memmove since we are
+    // overlapping the source and destination addresses.
+    memmove(&layer_list->list[layer_to_remove], &layer_list->list[layer_to_remove + 1],
+            sizeof(struct loader_layer_properties) * (layer_list->count - 1 - layer_to_remove));
+
+    // Decrement the count (because we now have one less) and decrement the loop index since we need to
+    // re-check this index.
+    layer_list->count--;
+}
+
 // Remove all layers in the layer list that are blacklisted by the override layer.
 // NOTE: This should only be called if an override layer is found and not expired.
 void loaderRemoveLayersInBlacklist(const struct loader_instance *inst, struct loader_layer_list *layer_list) {
@@ -2776,6 +2797,65 @@ static void VerifyAllMetaLayers(struct loader_instance *inst, struct loader_laye
     }
 }
 
+// If the current working directory matches any app_key_path of the layers, remove all other override layers.
+// Otherwise if no matching app_key was found, remove all but the global override layer, which has no app_key_path.
+static void RemoveAllNonValidOverrideLayers(struct loader_instance *inst, struct loader_layer_list *instance_layers) {
+    if (inst == NULL || instance_layers == NULL) {
+        return;
+    }
+
+    char cwd_out[MAX_STRING_SIZE];
+    char *ret = loader_current_directory(cwd_out);
+    if (ret == NULL) {
+        loader_log(inst, VK_DEBUG_REPORT_ERROR_BIT_EXT, 0,
+                   "RemoveAllNonValidOverrideLayers: Failed to get current working directory");
+        return;
+    }
+
+    // Find out if there are override layers with same the app_key_path as the current working directory.
+    int active_override_count = 0;  // where 1 means its unique
+    char active_override_app_key[MAX_STRING_SIZE];
+    for (uint32_t i = 0; i < instance_layers->count; i++) {
+        struct loader_layer_properties *props = &instance_layers->list[i];
+        if (strcmp(props->info.layerName, VK_OVERRIDE_LAYER_NAME) == 0) {
+            if (props->app_key_path[0] != 0) {
+                if (strcmp(props->app_key_path, cwd_out) == 0) {
+                    if (active_override_count > 1) {
+                        loader_log(inst, VK_DEBUG_REPORT_WARNING_BIT_EXT, 0,
+                                   "RemoveAllNonValidOverrideLayers: Multiple override layers with the same"
+                                   "app_key found. Using the first layer found");
+                    }
+                    memcpy(active_override_app_key, props->app_key_path, MAX_STRING_SIZE);
+                    active_override_count++;
+                }
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < instance_layers->count; i++) {
+        struct loader_layer_properties *props = &instance_layers->list[i];
+        if (strcmp(props->info.layerName, VK_OVERRIDE_LAYER_NAME) == 0) {
+            if (active_override_count > 0) {
+                // Remove duplicate active override layers that have the same app_key_path
+                if (active_override_count > 1 && strcmp(props->app_key_path, active_override_app_key) == 0) {
+                    loaderRemoveLayerInList(inst, instance_layers, i);
+                    i--;
+                    active_override_count--;
+                } else if (strcmp(props->app_key_path, active_override_app_key) != 0) {
+                    loaderRemoveLayerInList(inst, instance_layers, i);
+                    i--;
+                }
+            } else {
+                // Remove all but the global override layer
+                if (props->app_key_path[0] != 0) {
+                    loaderRemoveLayerInList(inst, instance_layers, i);
+                    i--;
+                }
+            }
+        }
+    }
+}
+
 // This structure is used to store the json file version
 // in a more manageable way.
 typedef struct {
@@ -3177,6 +3257,7 @@ static VkResult loaderReadLayerJson(const struct loader_instance *inst, struct l
     char *vkNegotiateLoaderLayerInterfaceVersion = NULL;
     char *spec_version = NULL;
     char **entry_array = NULL;
+    char *app_key = NULL;
 
     // Layer interface functions
     //    vkGetInstanceProcAddr
@@ -3363,6 +3444,13 @@ static VkResult loaderReadLayerJson(const struct loader_instance *inst, struct l
                 cJSON_Free(inst_version_name);
             }
         }
+    }
+
+    GET_JSON_ITEM(layer_node, app_key)
+    if (app_key != NULL) {
+        strncpy(props->app_key_path, app_key, MAX_STRING_SIZE - 1);
+    } else {
+        props->app_key_path[0] = 0;  // no app_key
     }
 
     result = VK_SUCCESS;
@@ -4541,6 +4629,9 @@ void loaderScanForLayers(struct loader_instance *inst, struct loader_layer_list 
         }
     }
 
+    // Remove any extraneous override layers.
+    RemoveAllNonValidOverrideLayers(inst, instance_layers);
+
     // Check to see if the override layer is present, and use it's override paths.
     for (int32_t i = 0; i < (int32_t)instance_layers->count; i++) {
         struct loader_layer_properties *prop = &instance_layers->list[i];
@@ -4601,6 +4692,9 @@ void loaderScanForLayers(struct loader_instance *inst, struct loader_layer_list 
             }
         }
     }
+
+    // Remove any extraneous override layers.
+    RemoveAllNonValidOverrideLayers(inst, instance_layers);
 
     // See if "VK_LAYER_LUNARG_standard_validation" already in list.
     bool found_std_val = false;
@@ -4696,6 +4790,9 @@ void loaderScanForImplicitLayers(struct loader_instance *inst, struct loader_lay
             goto out;
         }
     }
+
+    // Remove any extraneous override layers.
+    RemoveAllNonValidOverrideLayers(inst, instance_layers);
 
     // Check to see if either the override layer is present, or another implicit meta-layer.
     // Each of these may require explicit layers to be enabled at this time.
